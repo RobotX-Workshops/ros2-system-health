@@ -95,13 +95,6 @@ class SystemMonitor(Node):
         temp_msg.data = temp()
         self.temp_pub.publish(temp_msg)
 
-        self.get_logger().info(
-            f"Published: CPU: {cpu_msg.data:.1f}%, "
-            f"RAM: {memory_msg.data:.1f}%, "
-            f"Disk: {disk_msg.data:.1f}%, "
-            f"Temp: {temp_msg.data:.1f}°C"
-        )
-
 
 def main(args=None):
     rclpy.init(args=args)
