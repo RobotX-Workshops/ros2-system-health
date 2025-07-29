@@ -1,5 +1,6 @@
 # system_health/system_health/utils.py
 import logging
+import re
 import subprocess
 from typing import List
 
@@ -133,4 +134,176 @@ def temp() -> float:
         return float(output) / 1000.0  # Convert from millidegrees to degrees C
     except (subprocess.CalledProcessError, FileNotFoundError):
         logging.warning("Temperature reading not available")
+        return 0.0
+
+
+def cpu_voltage() -> float:
+    """Get the CPU voltage in volts."""
+    try:
+        output = subprocess.check_output(
+            "vcgencmd measure_volts core", shell=True
+        ).decode("utf-8")
+        return float(
+            output.split("=")[1].strip().split(" ")[0]
+        )  # Extract voltage value
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logging.warning("CPU Voltage reading not available")
+        return 0.0
+
+
+# Mapping of bit positions to their meanings for the 'get_throttled' command.
+# Each bit represents a specific hardware status.
+_THROTTLED_MESSAGES = {
+    # Current (Live) Status
+    0: "Under-voltage detected",
+    1: "ARM frequency capped",
+    2: "Currently throttled",
+    3: "Soft temperature limit active",
+    # Historical (Occurred since boot) Status
+    16: "Under-voltage has occurred",
+    17: "ARM frequency capping has occurred",
+    18: "Throttling has occurred",
+    19: "Soft temperature limit has occurred",
+}
+
+
+class SystemHealthError:
+    """Custom exception for system health errors."""
+
+    code: int
+    messages: List[str]
+
+    def __init__(self, code: int, messages: List[str]):
+        self.code = code
+        self.messages = messages
+
+
+def get_throttled_status(hex_code) -> SystemHealthError:
+    """
+    Parses the hexadecimal status code from 'vcgencmd get_throttled'
+    and returns a list of human-readable messages.
+
+    Args:
+        hex_code (str): The hexadecimal string (e.g., '0x50000') from the command.
+
+    Returns:
+        dict: A dictionary containing the integer code and a list of status messages.
+              Returns a clean status message if no issues are detected.
+    """
+    # Convert the hexadecimal string to an integer
+    try:
+        code = int(hex_code, 16)
+    except (ValueError, TypeError):
+        return SystemHealthError(
+            code=-1, messages=[f"Error: Invalid hexadecimal code '{hex_code}'"]
+        )
+
+    # Check for a healthy status
+    if code == 0:
+        return SystemHealthError(
+            code=0, messages=["✅ System status is OK. No issues detected."]
+        )
+
+    # Decode the bitmask
+    active_messages = []
+    for bit, message in _THROTTLED_MESSAGES.items():
+        # Use a bitwise AND to check if the specific bit is set in the code
+        if code & (1 << bit):
+            # Add a warning emoji for easier identification
+            active_messages.append(f"⚠️  {message}")
+
+    return SystemHealthError(code=code, messages=active_messages)
+
+
+def get_pi_status_directly() -> SystemHealthError:
+    """
+    Runs the 'vcgencmd get_throttled' command on a Raspberry Pi
+    and returns the parsed status.
+
+    Returns:
+        dict: The parsed status dictionary, or an error message if the
+              command fails (e.g., not running on a Pi).
+    """
+    try:
+        # Execute the command and capture the output
+        process = subprocess.run(
+            ["vcgencmd", "get_throttled"], capture_output=True, text=True, check=True
+        )
+        # The output is in the format "throttled=0x..."
+        hex_code = process.stdout.strip().split("=")[1]
+        return get_throttled_status(hex_code)
+    except FileNotFoundError:
+        return SystemHealthError(
+            code=-1,
+            messages=[
+                "Error: 'vcgencmd' command not found. Are you running this on a Raspberry Pi?"
+            ],
+        )
+    except Exception as e:
+        return SystemHealthError(code=-1, messages=[f"An error occurred: {e}"])
+
+
+def get_controller_battery(mac_address) -> float:
+    """
+    Uses UPower to find the battery percentage of a connected gaming device.
+
+    Args:
+        mac_address (str): The MAC address of the Bluetooth device.
+
+    Returns:
+        float: The battery percentage (0.0 to 100.0) or -1.0 if not found.
+    """
+    try:
+        # Find the UPower device path for the given MAC address.
+        # UPower replaces ':' with '_' in the device path.
+        mac_path_format = mac_address.replace(":", "_")
+
+        # Command to find the full device path
+        find_device_cmd = f"upower -e | grep 'gaming_input.*{mac_path_format}'"
+
+        # Run the command in a shell to allow for the pipe
+        device_path_process = subprocess.run(
+            find_device_cmd, shell=True, capture_output=True, text=True
+        )
+
+        # Check if a device path was found
+        if device_path_process.returncode != 0 or not device_path_process.stdout:
+            return -1.0
+
+        device_path = device_path_process.stdout.strip()
+
+        # Get the detailed info for the found device
+        info_process = subprocess.run(
+            ["upower", "-i", device_path], capture_output=True, text=True, check=True
+        )
+        output = info_process.stdout
+
+        # Parse for the percentage line, e.g., "percentage:         79%"
+        match = re.search(r"percentage:\s+(\d+)%", output)
+
+        if match:
+            percentage = match.group(1)
+            return float(percentage)
+        else:
+            return -1.0
+
+    except FileNotFoundError:
+        return -1.0
+    except Exception:
+        return -1.0
+
+
+def wifi_signal_strength() -> float:
+    "Gets the wi-fi signal strength in percentage."
+    try:
+        # Use iwconfig to get the signal strength of the Wi-Fi interface
+        output = subprocess.check_output(
+            "iwconfig wlan0 | grep -i --color signal", shell=True
+        ).decode("utf-8")
+        # Extract the signal strength value
+        signal_strength = int(output.split("=")[1].split()[0])
+        # Convert to percentage (assuming -100 dBm is 0% and -30 dBm is 100%)
+        return max(0.0, min(100.0, (signal_strength + 100) * 100 / 70))
+    except subprocess.CalledProcessError:
+        logging.error("Failed to get Wi-Fi signal strength")
         return 0.0
