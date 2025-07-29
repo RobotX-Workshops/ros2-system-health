@@ -143,9 +143,11 @@ def cpu_voltage() -> float:
         output = subprocess.check_output(
             "vcgencmd measure_volts core", shell=True
         ).decode("utf-8")
-        return float(
-            output.split("=")[1].strip().split(" ")[0]
-        )  # Extract voltage value
+
+        voltage_str = output.split("=")[1].strip().split(" ")[0]
+        if voltage_str.endswith("V"):
+            voltage_str = voltage_str[:-1]
+        return float(voltage_str)
     except (subprocess.CalledProcessError, FileNotFoundError):
         logging.warning("CPU Voltage reading not available")
         return 0.0
