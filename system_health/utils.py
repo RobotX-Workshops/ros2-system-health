@@ -302,10 +302,29 @@ def wifi_signal_strength() -> float:
         output = subprocess.check_output(
             "iwconfig wlan0 | grep -i --color signal", shell=True
         ).decode("utf-8")
-        # Extract the signal strength value
+
+        # Try to extract signal level in dBm first
+        if "Signal level=" in output:
+            # Look for dBm value (e.g., "Signal level=-45 dBm")
+            import re
+
+            dbm_match = re.search(r"Signal level=(-?\d+)\s*dBm", output)
+            if dbm_match:
+                signal_strength = int(dbm_match.group(1))
+                # Convert dBm to percentage (assuming -100 dBm is 0% and -30 dBm is 100%)
+                return max(0.0, min(100.0, (signal_strength + 100) * 100 / 70))
+
+        # Fallback: try to extract quality fraction (e.g., "70/70")
+        quality_match = re.search(r"Quality=(\d+)/(\d+)", output)
+        if quality_match:
+            current = int(quality_match.group(1))
+            maximum = int(quality_match.group(2))
+            return (current / maximum) * 100.0
+
+        # If neither format matches, try the original parsing as last resort
         signal_strength = int(output.split("=")[1].split()[0])
-        # Convert to percentage (assuming -100 dBm is 0% and -30 dBm is 100%)
         return max(0.0, min(100.0, (signal_strength + 100) * 100 / 70))
-    except subprocess.CalledProcessError:
-        logging.error("Failed to get Wi-Fi signal strength")
+
+    except (subprocess.CalledProcessError, ValueError, IndexError) as e:
+        logging.error(f"Failed to get Wi-Fi signal strength: {e}")
         return 0.0

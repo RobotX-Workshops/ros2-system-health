@@ -51,6 +51,10 @@ class SystemMonitor(Node):
             Float32, "system_health/cpu/voltage", 10
         )
 
+        # self.throttling_pub = self.create_publisher(
+        #     String, "system_health/throttling/status", 10
+        # )
+
         self.platform_pub = self.create_publisher(String, "system_health/platform", 10)
 
         self.ip_pub = self.create_publisher(
