@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm> // Required for std::remove
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32.hpp"
@@ -100,10 +101,8 @@ float temp()
     return 0.0f;
 }
 
-// MODIFIED: Check if vcgencmd exists before trying to run it.
 float cpu_voltage()
 {
-    // This check makes the function safe to run on non-Raspberry Pi systems.
     if (!exec_command("command -v vcgencmd").empty())
     {
         try
@@ -115,10 +114,10 @@ float cpu_voltage()
         }
         catch (...)
         {
-            return -1.0f; // Return -1 on error
+            return -1.0f;
         }
     }
-    return -1.0f; // Return -1 if command doesn't exist
+    return -1.0f;
 }
 
 std::string platform_model_str()
@@ -131,7 +130,6 @@ std::string platform_model_str()
         model.erase(std::remove(model.begin(), model.end(), '\0'), model.end());
         return model;
     }
-    // Fallback for non-Pi systems
     try
     {
         return exec_command("hostnamectl | grep 'Hardware Model' | sed 's/.*: //'");
@@ -142,7 +140,6 @@ std::string platform_model_str()
     }
 }
 
-// MODIFIED: Function now takes interface name as an argument
 std::string ip_address(const std::string &interface)
 {
     if (interface.empty())
@@ -160,7 +157,6 @@ std::string ip_address(const std::string &interface)
     }
 }
 
-// MODIFIED: Function now takes interface name as an argument
 float wifi_signal_strength(const std::string &interface)
 {
     if (interface.empty())
@@ -180,7 +176,6 @@ float wifi_signal_strength(const std::string &interface)
     }
     catch (...)
     {
-        // Fallthrough on error
     }
     return 0.0f;
 }
@@ -222,17 +217,20 @@ class SystemMonitorNode : public rclcpp::Node
 public:
     SystemMonitorNode() : Node("system_monitor_node")
     {
-        // MODIFIED: Added parameters for network interfaces
+        // MODIFIED: Added a parameter for the update frequency
         this->declare_parameter<std::string>("controller_mac_address", "");
         this->declare_parameter<std::string>("wifi_interface", "wlan0");
         this->declare_parameter<std::string>("ip_interface", "eth0");
+        this->declare_parameter<double>("update_frequency", 1.0); // Default to 1 Hz
 
         this->get_parameter("controller_mac_address", controller_mac_);
         this->get_parameter("wifi_interface", wifi_interface_);
         this->get_parameter("ip_interface", ip_interface_);
+        this->get_parameter("update_frequency", update_frequency_);
 
         RCLCPP_INFO(this->get_logger(), "Monitoring WiFi Interface: '%s'", wifi_interface_.c_str());
         RCLCPP_INFO(this->get_logger(), "Monitoring IP Interface: '%s'", ip_interface_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Timer frequency set to: %.2f Hz", update_frequency_);
 
         // Publishers
         cpu_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu_usage/percent", 10);
@@ -256,9 +254,15 @@ public:
             core_pubs_.push_back(pub);
         }
 
-        prev_cpu_times_ = get_cpu_times();
-        timer_ = this->create_wall_timer(std::chrono::seconds(1), std::bind(&SystemMonitorNode::timer_callback, this));
+        if (update_frequency_ <= 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Update frequency must be positive. Defaulting to 1.0 Hz.");
+            update_frequency_ = 1.0;
+        }
+        auto timer_period = std::chrono::duration<double>(1.0 / update_frequency_);
+        timer_ = this->create_wall_timer(timer_period, std::bind(&SystemMonitorNode::timer_callback, this));
 
+        prev_cpu_times_ = get_cpu_times();
         publish_static_info();
         RCLCPP_INFO(this->get_logger(), "C++ System Health Monitor started.");
     }
@@ -335,7 +339,6 @@ private:
             cpu_voltage_pub_->publish(voltage_msg);
         }
 
-        // MODIFIED: Use the configured WiFi interface
         auto wifi_msg = std_msgs::msg::Float32();
         wifi_msg.data = wifi_signal_strength(wifi_interface_);
         wifi_signal_pub_->publish(wifi_msg);
@@ -360,6 +363,7 @@ private:
     std::string controller_mac_;
     std::string wifi_interface_;
     std::string ip_interface_;
+    double update_frequency_;
 
     int num_cores_;
     std::vector<long> prev_cpu_times_;
