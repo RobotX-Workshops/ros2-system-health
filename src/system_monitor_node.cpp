@@ -8,11 +8,14 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <algorithm> // Required for std::remove
+#include <algorithm>
+#include <map>
+#include <limits>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "std_msgs/msg/bool.hpp"
 
 // Utility function to execute a shell command and get its output
 std::string exec_command(const char *cmd)
@@ -211,17 +214,45 @@ float get_controller_battery(const std::string &mac_address)
     }
     return -1.0f;
 }
+struct HealthCheck
+{
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr publisher;
+    double min_threshold;
+    double max_threshold;
+    bool is_healthy = true;
+
+    HealthCheck(rclcpp::Node *parent_node, const std::string &metric_name)
+    {
+        // Use very large/small numbers as defaults to effectively disable a check if not set
+        double default_min = std::numeric_limits<double>::lowest();
+        double default_max = std::numeric_limits<double>::max();
+
+        // Declare parameters with a "health." prefix for organization
+        min_threshold = parent_node->declare_parameter("health." + metric_name + ".min", default_min);
+        max_threshold = parent_node->declare_parameter("health." + metric_name + ".max", default_max);
+
+        // Create a publisher for this specific health status
+        publisher = parent_node->create_publisher<std_msgs::msg::Bool>("system_health/" + metric_name + "/health", 10);
+    }
+
+    void update(double value)
+    {
+        is_healthy = (value >= min_threshold && value <= max_threshold);
+        auto msg = std_msgs::msg::Bool();
+        msg.data = is_healthy;
+        publisher->publish(msg);
+    }
+};
 
 class SystemMonitorNode : public rclcpp::Node
 {
 public:
     SystemMonitorNode() : Node("system_monitor_node")
     {
-        // MODIFIED: Added a parameter for the update frequency
         this->declare_parameter<std::string>("controller_mac_address", "");
         this->declare_parameter<std::string>("wifi_interface", "wlan0");
         this->declare_parameter<std::string>("ip_interface", "eth0");
-        this->declare_parameter<double>("update_frequency", 1.0); // Default to 1 Hz
+        this->declare_parameter<double>("update_frequency", 1.0);
 
         this->get_parameter("controller_mac_address", controller_mac_);
         this->get_parameter("wifi_interface", wifi_interface_);
@@ -232,7 +263,7 @@ public:
         RCLCPP_INFO(this->get_logger(), "Monitoring IP Interface: '%s'", ip_interface_.c_str());
         RCLCPP_INFO(this->get_logger(), "Timer frequency set to: %.2f Hz", update_frequency_);
 
-        // Publishers
+        // Value Publishers
         cpu_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu_usage/percent", 10);
         memory_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/memory_usage/percent", 10);
         disk_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/disk_usage/percent", 10);
@@ -246,6 +277,16 @@ public:
         {
             controller_battery_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/controller/battery/percent", 10);
         }
+
+        // Health Publishers
+        overall_health_pub_ = this->create_publisher<std_msgs::msg::Bool>("system_health/overall_health", 10);
+
+        // Initialize HealthCheck objects for each metric
+        health_checks_.emplace("cpu", HealthCheck(this, "cpu"));
+        health_checks_.emplace("memory", HealthCheck(this, "memory"));
+        health_checks_.emplace("disk", HealthCheck(this, "disk"));
+        health_checks_.emplace("temperature", HealthCheck(this, "temperature"));
+        health_checks_.emplace("wifi_signal", HealthCheck(this, "wifi_signal"));
 
         num_cores_ = get_core_count();
         for (int i = 0; i < num_cores_; ++i)
@@ -264,7 +305,7 @@ public:
 
         prev_cpu_times_ = get_cpu_times();
         publish_static_info();
-        RCLCPP_INFO(this->get_logger(), "C++ System Health Monitor started.");
+        RCLCPP_INFO(this->get_logger(), "System Health Monitor started with health checks.");
     }
 
 private:
@@ -281,6 +322,7 @@ private:
 
     void timer_callback()
     {
+        // --- Get and Publish Metric Values ---
         std::vector<long> current_cpu_times = get_cpu_times();
         float total_cpu_usage = 0.0f;
         if (current_cpu_times.size() >= prev_cpu_times_.size() && !prev_cpu_times_.empty())
@@ -290,10 +332,8 @@ private:
                 int offset = (i + 1) * 10;
                 if (static_cast<size_t>(offset + 4) >= current_cpu_times.size())
                     continue;
-
                 long prev_idle = prev_cpu_times_[offset + 3] + prev_cpu_times_[offset + 4];
                 long current_idle = current_cpu_times[offset + 3] + current_cpu_times[offset + 4];
-
                 long prev_total = 0;
                 long current_total = 0;
                 for (int j = 0; j < 10; ++j)
@@ -301,12 +341,9 @@ private:
                     prev_total += prev_cpu_times_[offset + j];
                     current_total += current_cpu_times[offset + j];
                 }
-
                 long total_diff = current_total - prev_total;
                 long idle_diff = current_idle - prev_idle;
-
                 float cpu_percent = total_diff > 0 ? (1.0f - static_cast<float>(idle_diff) / total_diff) * 100.0f : 0.0f;
-
                 auto core_msg = std_msgs::msg::Float32();
                 core_msg.data = cpu_percent;
                 core_pubs_[i]->publish(core_msg);
@@ -315,20 +352,24 @@ private:
         }
         prev_cpu_times_ = current_cpu_times;
 
+        float avg_cpu_usage = num_cores_ > 0 ? total_cpu_usage / num_cores_ : 0.0f;
         auto cpu_msg = std_msgs::msg::Float32();
-        cpu_msg.data = num_cores_ > 0 ? total_cpu_usage / num_cores_ : 0.0f;
+        cpu_msg.data = avg_cpu_usage;
         cpu_pub_->publish(cpu_msg);
 
+        float mem_usage = memory_usage_percentage();
         auto mem_msg = std_msgs::msg::Float32();
-        mem_msg.data = memory_usage_percentage();
+        mem_msg.data = mem_usage;
         memory_pub_->publish(mem_msg);
 
+        float disk_usage = disk_usage_percentage();
         auto disk_msg = std_msgs::msg::Float32();
-        disk_msg.data = disk_usage_percentage();
+        disk_msg.data = disk_usage;
         disk_pub_->publish(disk_msg);
 
+        float temp_val = temp();
         auto temp_msg = std_msgs::msg::Float32();
-        temp_msg.data = temp();
+        temp_msg.data = temp_val;
         temp_pub_->publish(temp_msg);
 
         float voltage = cpu_voltage();
@@ -339,8 +380,9 @@ private:
             cpu_voltage_pub_->publish(voltage_msg);
         }
 
+        float wifi_val = wifi_signal_strength(wifi_interface_);
         auto wifi_msg = std_msgs::msg::Float32();
-        wifi_msg.data = wifi_signal_strength(wifi_interface_);
+        wifi_msg.data = wifi_val;
         wifi_signal_pub_->publish(wifi_msg);
 
         if (!controller_mac_.empty())
@@ -352,6 +394,27 @@ private:
                 controller_battery_pub_->publish(battery_msg);
             }
         }
+
+        // --- Update and Publish Health Statuses ---
+        health_checks_.at("cpu").update(avg_cpu_usage);
+        health_checks_.at("memory").update(mem_usage);
+        health_checks_.at("disk").update(disk_usage);
+        health_checks_.at("temperature").update(temp_val);
+        health_checks_.at("wifi_signal").update(wifi_val);
+
+        // Calculate and publish overall health
+        bool overall_status = true;
+        for (auto const &[name, check] : health_checks_)
+        {
+            if (!check.is_healthy)
+            {
+                overall_status = false;
+                break; // One failure makes the whole system unhealthy
+            }
+        }
+        auto health_msg = std_msgs::msg::Bool();
+        health_msg.data = overall_status;
+        overall_health_pub_->publish(health_msg);
     }
 
     rclcpp::TimerBase::SharedPtr timer_;
@@ -360,11 +423,12 @@ private:
     std::vector<rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr> core_pubs_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr controller_battery_pub_;
 
-    std::string controller_mac_;
-    std::string wifi_interface_;
-    std::string ip_interface_;
-    double update_frequency_;
+    // Health check members
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr overall_health_pub_;
+    std::map<std::string, HealthCheck> health_checks_;
 
+    std::string controller_mac_, wifi_interface_, ip_interface_;
+    double update_frequency_;
     int num_cores_;
     std::vector<long> prev_cpu_times_;
 };
