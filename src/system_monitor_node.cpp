@@ -6,8 +6,8 @@
 #include <regex>
 #include <sstream>
 #include <string>
-#include <vector>
 #include <thread>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32.hpp"
@@ -21,8 +21,6 @@ std::string exec_command(const char *cmd)
     std::unique_ptr<FILE, int (*)(FILE *)> pipe(popen(cmd, "r"), pclose);
     if (!pipe)
     {
-        // Using RCLCPP_ERROR for logging within a ROS context if possible,
-        // but for a general utility, std::runtime_error is fine.
         throw std::runtime_error("popen() failed!");
     }
     while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
@@ -32,7 +30,7 @@ std::string exec_command(const char *cmd)
     return result;
 }
 
-// === Utility Functions (translation of utils.py) ===
+// === Utility Functions ===
 
 int get_core_count()
 {
@@ -53,7 +51,7 @@ std::vector<long> get_cpu_times()
         {
             std::stringstream ss(line);
             std::string cpu_label;
-            ss >> cpu_label; // "cpu", "cpu0", etc.
+            ss >> cpu_label;
             long time;
             while (ss >> time)
             {
@@ -102,20 +100,25 @@ float temp()
     return 0.0f;
 }
 
+// MODIFIED: Check if vcgencmd exists before trying to run it.
 float cpu_voltage()
 {
-    try
+    // This check makes the function safe to run on non-Raspberry Pi systems.
+    if (!exec_command("command -v vcgencmd").empty())
     {
-        std::string result = exec_command("vcgencmd measure_volts core");
-        // Output is "volt=1.2345V"
-        size_t start = result.find('=') + 1;
-        size_t end = result.find('V');
-        return std::stof(result.substr(start, end - start));
+        try
+        {
+            std::string result = exec_command("vcgencmd measure_volts core");
+            size_t start = result.find('=') + 1;
+            size_t end = result.find('V');
+            return std::stof(result.substr(start, end - start));
+        }
+        catch (...)
+        {
+            return -1.0f; // Return -1 on error
+        }
     }
-    catch (...)
-    {
-        return 0.0f;
-    }
+    return -1.0f; // Return -1 if command doesn't exist
 }
 
 std::string platform_model_str()
@@ -125,19 +128,13 @@ std::string platform_model_str()
     {
         std::string model;
         std::getline(model_file, model);
-        // Remove null characters
         model.erase(std::remove(model.begin(), model.end(), '\0'), model.end());
         return model;
     }
-    return "N/A";
-}
-
-std::string ip_address(const std::string &interface)
-{
+    // Fallback for non-Pi systems
     try
     {
-        std::string cmd = "ip -4 addr show " + interface + " | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'";
-        return exec_command(cmd.c_str());
+        return exec_command("hostnamectl | grep 'Hardware Model' | sed 's/.*: //'");
     }
     catch (...)
     {
@@ -145,11 +142,33 @@ std::string ip_address(const std::string &interface)
     }
 }
 
-float wifi_signal_strength()
+// MODIFIED: Function now takes interface name as an argument
+std::string ip_address(const std::string &interface)
 {
+    if (interface.empty())
+        return "N/A";
     try
     {
-        std::string result = exec_command("iwconfig wlan0");
+        std::string cmd = "ip -4 addr show " + interface + " | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'";
+        std::string result = exec_command(cmd.c_str());
+        result.erase(std::remove(result.begin(), result.end(), '\n'), result.end());
+        return result.empty() ? "N/A" : result;
+    }
+    catch (...)
+    {
+        return "N/A";
+    }
+}
+
+// MODIFIED: Function now takes interface name as an argument
+float wifi_signal_strength(const std::string &interface)
+{
+    if (interface.empty())
+        return 0.0f;
+    try
+    {
+        std::string cmd = "iwconfig " + interface;
+        std::string result = exec_command(cmd.c_str());
         std::smatch match;
         std::regex quality_regex("Quality=(\\d+)/(\\d+)");
         if (std::regex_search(result, match, quality_regex) && match.size() == 3)
@@ -161,7 +180,7 @@ float wifi_signal_strength()
     }
     catch (...)
     {
-        // Fallthrough
+        // Fallthrough on error
     }
     return 0.0f;
 }
@@ -203,9 +222,17 @@ class SystemMonitorNode : public rclcpp::Node
 public:
     SystemMonitorNode() : Node("system_monitor_node")
     {
-        // Parameters
+        // MODIFIED: Added parameters for network interfaces
         this->declare_parameter<std::string>("controller_mac_address", "");
+        this->declare_parameter<std::string>("wifi_interface", "wlan0");
+        this->declare_parameter<std::string>("ip_interface", "eth0");
+
         this->get_parameter("controller_mac_address", controller_mac_);
+        this->get_parameter("wifi_interface", wifi_interface_);
+        this->get_parameter("ip_interface", ip_interface_);
+
+        RCLCPP_INFO(this->get_logger(), "Monitoring WiFi Interface: '%s'", wifi_interface_.c_str());
+        RCLCPP_INFO(this->get_logger(), "Monitoring IP Interface: '%s'", ip_interface_.c_str());
 
         // Publishers
         cpu_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu_usage/percent", 10);
@@ -222,7 +249,6 @@ public:
             controller_battery_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/controller/battery/percent", 10);
         }
 
-        // Dynamic per-core publishers
         num_cores_ = get_core_count();
         for (int i = 0; i < num_cores_; ++i)
         {
@@ -230,13 +256,9 @@ public:
             core_pubs_.push_back(pub);
         }
 
-        // Initialize CPU times for usage calculation
         prev_cpu_times_ = get_cpu_times();
-
-        // Timer
         timer_ = this->create_wall_timer(std::chrono::seconds(1), std::bind(&SystemMonitorNode::timer_callback, this));
 
-        // Publish static info at startup
         publish_static_info();
         RCLCPP_INFO(this->get_logger(), "C++ System Health Monitor started.");
     }
@@ -249,22 +271,22 @@ private:
         platform_pub_->publish(platform_msg);
 
         auto ip_msg = std_msgs::msg::String();
-        ip_msg.data = ip_address("eth0"); // Or make configurable
+        ip_msg.data = ip_address(ip_interface_);
         ip_pub_->publish(ip_msg);
     }
 
     void timer_callback()
     {
-        // CPU Usage Calculation
         std::vector<long> current_cpu_times = get_cpu_times();
         float total_cpu_usage = 0.0f;
-        if (current_cpu_times.size() == prev_cpu_times_.size())
+        if (current_cpu_times.size() >= prev_cpu_times_.size() && !prev_cpu_times_.empty())
         {
-            // Per-core CPU
             for (int i = 0; i < num_cores_; ++i)
             {
-                // Each core has 10 values in /proc/stat
                 int offset = (i + 1) * 10;
+                if (static_cast<size_t>(offset + 4) >= current_cpu_times.size())
+                    continue;
+
                 long prev_idle = prev_cpu_times_[offset + 3] + prev_cpu_times_[offset + 4];
                 long current_idle = current_cpu_times[offset + 3] + current_cpu_times[offset + 4];
 
@@ -289,12 +311,10 @@ private:
         }
         prev_cpu_times_ = current_cpu_times;
 
-        // Overall CPU
         auto cpu_msg = std_msgs::msg::Float32();
-        cpu_msg.data = total_cpu_usage / num_cores_;
+        cpu_msg.data = num_cores_ > 0 ? total_cpu_usage / num_cores_ : 0.0f;
         cpu_pub_->publish(cpu_msg);
 
-        // Other metrics
         auto mem_msg = std_msgs::msg::Float32();
         mem_msg.data = memory_usage_percentage();
         memory_pub_->publish(mem_msg);
@@ -307,12 +327,17 @@ private:
         temp_msg.data = temp();
         temp_pub_->publish(temp_msg);
 
-        auto voltage_msg = std_msgs::msg::Float32();
-        voltage_msg.data = cpu_voltage();
-        cpu_voltage_pub_->publish(voltage_msg);
+        float voltage = cpu_voltage();
+        if (voltage >= 0.0f)
+        {
+            auto voltage_msg = std_msgs::msg::Float32();
+            voltage_msg.data = voltage;
+            cpu_voltage_pub_->publish(voltage_msg);
+        }
 
+        // MODIFIED: Use the configured WiFi interface
         auto wifi_msg = std_msgs::msg::Float32();
-        wifi_msg.data = wifi_signal_strength();
+        wifi_msg.data = wifi_signal_strength(wifi_interface_);
         wifi_signal_pub_->publish(wifi_msg);
 
         if (!controller_mac_.empty())
@@ -333,6 +358,9 @@ private:
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr controller_battery_pub_;
 
     std::string controller_mac_;
+    std::string wifi_interface_;
+    std::string ip_interface_;
+
     int num_cores_;
     std::vector<long> prev_cpu_times_;
 };
