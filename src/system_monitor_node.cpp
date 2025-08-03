@@ -279,7 +279,7 @@ public:
         }
 
         // Health Publishers
-        overall_health_pub_ = this->create_publisher<std_msgs::msg::Bool>("system_health/overall_health", 10);
+        overall_health_pub_ = this->create_publisher<std_msgs::msg::Bool>("system_health/overall/is_healthy", 10);
 
         // Initialize HealthCheck objects for each metric
         health_checks_.emplace("cpu", HealthCheck(this, "cpu"));
