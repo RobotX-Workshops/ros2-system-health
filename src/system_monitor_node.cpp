@@ -264,11 +264,11 @@ public:
         RCLCPP_INFO(this->get_logger(), "Timer frequency set to: %.2f Hz", update_frequency_);
 
         // Value Publishers
-        cpu_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu_usage/percent", 10);
-        memory_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/memory_usage/percent", 10);
-        disk_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/disk_usage/percent", 10);
-        temp_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/temperature/celsius", 10);
+        cpu_usage_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu/usage/percent", 10);
+        cpu_temp_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu/temperature/celsius", 10);
         cpu_voltage_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/cpu/voltage", 10);
+        memory_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/memory/usage/percent", 10);
+        disk_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/disk/usage/percent", 10);
         platform_pub_ = this->create_publisher<std_msgs::msg::String>("system_health/platform", 10);
         ip_pub_ = this->create_publisher<std_msgs::msg::String>("system_health/ip_address_string", 10);
         wifi_signal_pub_ = this->create_publisher<std_msgs::msg::Float32>("system_health/wifi/signal/percent", 10);
@@ -279,7 +279,7 @@ public:
         }
 
         // Health Publishers
-        overall_health_pub_ = this->create_publisher<std_msgs::msg::Bool>("system_health/overall_health", 10);
+        overall_health_pub_ = this->create_publisher<std_msgs::msg::Bool>("system_health/overall/is_healthy", 10);
 
         // Initialize HealthCheck objects for each metric
         health_checks_.emplace("cpu", HealthCheck(this, "cpu"));
@@ -287,6 +287,12 @@ public:
         health_checks_.emplace("disk", HealthCheck(this, "disk"));
         health_checks_.emplace("temperature", HealthCheck(this, "temperature"));
         health_checks_.emplace("wifi_signal", HealthCheck(this, "wifi_signal"));
+
+        // Only create controller battery health check if controller MAC is provided
+        if (!controller_mac_.empty())
+        {
+            health_checks_.emplace("controller_battery", HealthCheck(this, "controller_battery"));
+        }
 
         num_cores_ = get_core_count();
         for (int i = 0; i < num_cores_; ++i)
@@ -355,7 +361,7 @@ private:
         float avg_cpu_usage = num_cores_ > 0 ? total_cpu_usage / num_cores_ : 0.0f;
         auto cpu_msg = std_msgs::msg::Float32();
         cpu_msg.data = avg_cpu_usage;
-        cpu_pub_->publish(cpu_msg);
+        cpu_usage_pub_->publish(cpu_msg);
 
         float mem_usage = memory_usage_percentage();
         auto mem_msg = std_msgs::msg::Float32();
@@ -370,7 +376,7 @@ private:
         float temp_val = temp();
         auto temp_msg = std_msgs::msg::Float32();
         temp_msg.data = temp_val;
-        temp_pub_->publish(temp_msg);
+        cpu_temp_pub_->publish(temp_msg);
 
         float voltage = cpu_voltage();
         if (voltage >= 0.0f)
@@ -385,10 +391,12 @@ private:
         wifi_msg.data = wifi_val;
         wifi_signal_pub_->publish(wifi_msg);
 
+        float controller_battery_val = -1.0f;
         if (!controller_mac_.empty())
         {
             auto battery_msg = std_msgs::msg::Float32();
-            battery_msg.data = get_controller_battery(controller_mac_);
+            controller_battery_val = get_controller_battery(controller_mac_);
+            battery_msg.data = controller_battery_val;
             if (battery_msg.data >= 0)
             {
                 controller_battery_pub_->publish(battery_msg);
@@ -401,6 +409,12 @@ private:
         health_checks_.at("disk").update(disk_usage);
         health_checks_.at("temperature").update(temp_val);
         health_checks_.at("wifi_signal").update(wifi_val);
+
+        // Only update controller battery health if controller is present
+        if (!controller_mac_.empty())
+        {
+            health_checks_.at("controller_battery").update(controller_battery_val);
+        }
 
         // Calculate and publish overall health
         bool overall_status = true;
@@ -418,7 +432,7 @@ private:
     }
 
     rclcpp::TimerBase::SharedPtr timer_;
-    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr cpu_pub_, memory_pub_, disk_pub_, temp_pub_, cpu_voltage_pub_, wifi_signal_pub_;
+    rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr cpu_usage_pub_, memory_pub_, disk_pub_, cpu_temp_pub_, cpu_voltage_pub_, wifi_signal_pub_;
     rclcpp::Publisher<std_msgs::msg::String>::SharedPtr platform_pub_, ip_pub_;
     std::vector<rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr> core_pubs_;
     rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr controller_battery_pub_;
