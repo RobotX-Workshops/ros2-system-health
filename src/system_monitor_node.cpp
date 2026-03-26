@@ -11,13 +11,18 @@
 #include <algorithm>
 #include <map>
 #include <limits>
+#include <sys/statvfs.h>
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 
 #include "rclcpp/rclcpp.hpp"
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/string.hpp"
 #include "std_msgs/msg/bool.hpp"
 
-// Utility function to execute a shell command and get its output
+// exec_command: kept only for optional functions (vcgencmd, upower, hostnamectl)
+// that have no /proc equivalent. Memory, disk, and WiFi no longer use it.
 std::string exec_command(const char *cmd)
 {
     std::array<char, 128> buffer;
@@ -66,30 +71,35 @@ std::vector<long> get_cpu_times()
     return times;
 }
 
+// Read memory usage directly from /proc/meminfo — no fork/exec.
 float memory_usage_percentage()
 {
-    try
+    std::ifstream meminfo("/proc/meminfo");
+    if (!meminfo.is_open()) return 0.0f;
+
+    long total_kb = 0, available_kb = 0;
+    std::string line;
+    while (std::getline(meminfo, line))
     {
-        std::string result = exec_command("free -m | awk 'NR==2{printf \"%.2f\", $3*100/$2 }'");
-        return std::stof(result);
+        if (line.rfind("MemTotal:", 0) == 0)
+            std::sscanf(line.c_str(), "MemTotal: %ld kB", &total_kb);
+        else if (line.rfind("MemAvailable:", 0) == 0)
+            std::sscanf(line.c_str(), "MemAvailable: %ld kB", &available_kb);
+        if (total_kb > 0 && available_kb > 0) break;
     }
-    catch (...)
-    {
-        return 0.0f;
-    }
+    if (total_kb <= 0) return 0.0f;
+    return static_cast<float>((total_kb - available_kb) * 100.0 / total_kb);
 }
 
+// Read disk usage via statvfs — no fork/exec.
 float disk_usage_percentage()
 {
-    try
-    {
-        std::string result = exec_command("df -h | awk '$NF==\"/\"{printf \"%s\", $5}' | sed 's/%//'");
-        return std::stof(result);
-    }
-    catch (...)
-    {
-        return 0.0f;
-    }
+    struct statvfs fs {};
+    if (statvfs("/", &fs) != 0) return 0.0f;
+    const uint64_t total = fs.f_blocks * fs.f_frsize;
+    const uint64_t avail = fs.f_bavail * fs.f_frsize;
+    if (total == 0) return 0.0f;
+    return static_cast<float>((total - avail) * 100.0 / total);
 }
 
 float temp()
@@ -143,42 +153,50 @@ std::string platform_model_str()
     }
 }
 
+// Read IP address via getifaddrs() — no fork/exec.
 std::string ip_address(const std::string &interface)
 {
-    if (interface.empty())
-        return "N/A";
-    try
+    if (interface.empty()) return "N/A";
+
+    struct ifaddrs *ifaddr = nullptr;
+    if (getifaddrs(&ifaddr) != 0) return "N/A";
+
+    std::string result = "N/A";
+    for (struct ifaddrs *ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next)
     {
-        std::string cmd = "ip -4 addr show " + interface + " | grep -oP '(?<=inet\\s)\\d+(\\.\\d+){3}'";
-        std::string result = exec_command(cmd.c_str());
-        result.erase(std::remove(result.begin(), result.end(), '\n'), result.end());
-        return result.empty() ? "N/A" : result;
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+        if (interface != ifa->ifa_name) continue;
+        char buf[INET_ADDRSTRLEN];
+        auto *addr_in = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+        if (inet_ntop(AF_INET, &addr_in->sin_addr, buf, sizeof(buf)))
+            result = buf;
+        break;
     }
-    catch (...)
-    {
-        return "N/A";
-    }
+    freeifaddrs(ifaddr);
+    return result;
 }
 
+// Read WiFi link quality from /proc/net/wireless — no fork/exec.
+// Falls back to 0 if the interface is not present (e.g. Ethernet-only host).
 float wifi_signal_strength(const std::string &interface)
 {
-    if (interface.empty())
-        return 0.0f;
-    try
+    if (interface.empty()) return 0.0f;
+
+    std::ifstream proc_wireless("/proc/net/wireless");
+    if (!proc_wireless.is_open()) return 0.0f;
+
+    std::string line;
+    while (std::getline(proc_wireless, line))
     {
-        std::string cmd = "iwconfig " + interface;
-        std::string result = exec_command(cmd.c_str());
-        std::smatch match;
-        std::regex quality_regex("Quality=(\\d+)/(\\d+)");
-        if (std::regex_search(result, match, quality_regex) && match.size() == 3)
-        {
-            float current = std::stof(match[1].str());
-            float total = std::stof(match[2].str());
-            return (current / total) * 100.0f;
-        }
-    }
-    catch (...)
-    {
+        if (line.find(interface) == std::string::npos) continue;
+        // Format: <iface>: <status> <link>. <level>. <noise>. ...
+        // "link" is quality 0–70 on most drivers; normalise to 0–100 %.
+        std::istringstream ss(line);
+        std::string iface_col;
+        int status = 0;
+        float link = 0.0f;
+        ss >> iface_col >> std::hex >> status >> std::dec >> link;
+        return std::min(link / 70.0f * 100.0f, 100.0f);
     }
     return 0.0f;
 }
