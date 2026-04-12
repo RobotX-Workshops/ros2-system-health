@@ -31,6 +31,8 @@ if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
+  # clang-format is the primary C++ formatter (via pre-commit); skip uncrustify to avoid conflicts
+  set(AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify)
   ament_lint_auto_find_test_dependencies()
 
   ament_add_gtest(test_system_metrics test/test_system_metrics.cpp)
