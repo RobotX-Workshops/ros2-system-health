@@ -439,8 +439,11 @@ private:
     health_checks_.at("temperature").update(temp_val);
     health_checks_.at("wifi_signal").update(wifi_val);
 
-    // Only update controller battery health if controller is present
-    if (!controller_mac_.empty()) {
+    // Skip the health update when the reading is unknown (-1 sentinel from
+    // get_controller_battery) — e.g. xpad-bound pads expose no UPower entry.
+    // Leaving is_healthy untouched keeps overall health green rather than
+    // failing the threshold compare on the sentinel.
+    if (!controller_mac_.empty() && controller_battery_val >= 0) {
       health_checks_.at("controller_battery").update(controller_battery_val);
     }
 
