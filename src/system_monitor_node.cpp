@@ -211,6 +211,88 @@ float wifi_signal_strength(const std::string & interface)
   return 0.0f;
 }
 
+// Enumerate every wifi interface that /proc/net/wireless reports as associated
+// (link > 0). Returns pairs of (iface, link_quality_0_to_70).
+std::vector<std::pair<std::string, float>> associated_wifi_interfaces()
+{
+  std::vector<std::pair<std::string, float>> result;
+  std::ifstream proc_wireless("/proc/net/wireless");
+  if (!proc_wireless.is_open()) {
+    return result;
+  }
+  std::string line;
+  // Skip the two header lines.
+  std::getline(proc_wireless, line);
+  std::getline(proc_wireless, line);
+  while (std::getline(proc_wireless, line)) {
+    std::istringstream ss(line);
+    std::string iface_col;
+    ss >> iface_col;
+    if (iface_col.empty() || iface_col.back() != ':') {
+      continue;
+    }
+    iface_col.pop_back();  // drop trailing ':'
+    int status = 0;
+    float link = 0.0f;
+    ss >> std::hex >> status >> std::dec >> link;
+    if (link > 0.0f) {
+      result.emplace_back(std::move(iface_col), link);
+    }
+  }
+  return result;
+}
+
+// Iface owning the IPv4 default route, or empty if there is none.
+// Reads /proc/net/route — no fork/exec. The kernel exports interface names
+// (truncated at 15 chars) and hex destination/mask, so we just look for the
+// row with destination=0 and mask=0.
+std::string default_route_interface()
+{
+  std::ifstream proc_route("/proc/net/route");
+  if (!proc_route.is_open()) {
+    return "";
+  }
+  std::string line;
+  std::getline(proc_route, line);  // skip header
+  while (std::getline(proc_route, line)) {
+    std::istringstream ss(line);
+    std::string iface, dest_hex, gw_hex;
+    int flags = 0, refcnt = 0, use = 0, metric = 0;
+    std::string mask_hex;
+    if (!(ss >> iface >> dest_hex >> gw_hex >> flags >> refcnt >> use >> metric >> mask_hex)) {
+      continue;
+    }
+    if (dest_hex == "00000000" && mask_hex == "00000000") {
+      return iface;
+    }
+  }
+  return "";
+}
+
+// "The wifi interface currently carrying the link." Pick the one owning the
+// default route if it is itself associated; otherwise fall back to the
+// strongest associated wifi NIC; otherwise return empty.
+std::string active_wifi_interface()
+{
+  const auto associated = associated_wifi_interfaces();
+  if (associated.empty()) {
+    return "";
+  }
+  const std::string default_iface = default_route_interface();
+  for (const auto & [iface, _] : associated) {
+    if (iface == default_iface) {
+      return iface;
+    }
+  }
+  // No wifi owns the default route (e.g. ethernet is preferred). Fall back to
+  // the strongest associated wifi NIC, since the user may still be using it
+  // for something even if the default route is elsewhere.
+  auto best = std::max_element(
+    associated.begin(), associated.end(),
+    [](const auto & a, const auto & b) { return a.second < b.second; });
+  return best->first;
+}
+
 float get_controller_battery(const std::string & mac_address)
 {
   if (mac_address.empty()) {
@@ -277,16 +359,39 @@ public:
   SystemMonitorNode() : Node("system_monitor_node")
   {
     this->declare_parameter<std::string>("controller_mac_address", "");
-    this->declare_parameter<std::string>("wifi_interface", "wlan0");
+    // Empty / "auto" → auto-detect the active wifi interface every tick (the
+    // interface currently owning the default route, or the strongest
+    // associated NIC). An explicit name overrides auto-detection — used when
+    // you want to monitor a specific NIC's signal even if it isn't the
+    // primary route.
+    this->declare_parameter<std::string>("wifi_interface", "");
+    // Optional. If non-empty, the node compares it to the auto-detected
+    // active wifi interface every tick. A mismatch (e.g. wlp1s0 expected but
+    // wlan0 is what's actually carrying traffic, meaning the external
+    // antenna failed over) trips wifi_interface health → false → overall
+    // health → false. Leave blank to disable the check.
+    this->declare_parameter<std::string>("expected_wifi_interface", "");
     this->declare_parameter<std::string>("ip_interface", "eth0");
     this->declare_parameter<double>("update_frequency", 1.0);
 
     this->get_parameter("controller_mac_address", controller_mac_);
-    this->get_parameter("wifi_interface", wifi_interface_);
+    this->get_parameter("wifi_interface", wifi_interface_override_);
+    this->get_parameter("expected_wifi_interface", expected_wifi_interface_);
     this->get_parameter("ip_interface", ip_interface_);
     this->get_parameter("update_frequency", update_frequency_);
 
-    RCLCPP_INFO(this->get_logger(), "Monitoring WiFi Interface: '%s'", wifi_interface_.c_str());
+    if (wifi_interface_override_.empty() || wifi_interface_override_ == "auto") {
+      RCLCPP_INFO(this->get_logger(), "WiFi interface: auto-detect");
+    } else {
+      RCLCPP_INFO(
+        this->get_logger(), "WiFi interface override: '%s'", wifi_interface_override_.c_str());
+    }
+    if (expected_wifi_interface_.empty()) {
+      RCLCPP_INFO(this->get_logger(), "Expected WiFi interface check: disabled");
+    } else {
+      RCLCPP_INFO(
+        this->get_logger(), "Expected WiFi interface: '%s'", expected_wifi_interface_.c_str());
+    }
     RCLCPP_INFO(this->get_logger(), "Monitoring IP Interface: '%s'", ip_interface_.c_str());
     RCLCPP_INFO(this->get_logger(), "Timer frequency set to: %.2f Hz", update_frequency_);
 
@@ -305,6 +410,10 @@ public:
     ip_pub_ = this->create_publisher<std_msgs::msg::String>("system_health/ip_address_string", 10);
     wifi_signal_pub_ =
       this->create_publisher<std_msgs::msg::Float32>("system_health/wifi/signal/percent", 10);
+    wifi_interface_pub_ =
+      this->create_publisher<std_msgs::msg::String>("system_health/wifi/interface", 10);
+    wifi_interface_health_pub_ =
+      this->create_publisher<std_msgs::msg::Bool>("system_health/wifi_interface/health", 10);
 
     if (!controller_mac_.empty()) {
       controller_battery_pub_ = this->create_publisher<std_msgs::msg::Float32>(
@@ -417,10 +526,40 @@ private:
       cpu_voltage_pub_->publish(voltage_msg);
     }
 
-    float wifi_val = wifi_signal_strength(wifi_interface_);
+    // Resolve the wifi interface once per tick. The override exists for
+    // operators who want to lock signal monitoring to a specific NIC; the
+    // default flow is auto-detect.
+    const bool override_set =
+      !wifi_interface_override_.empty() && wifi_interface_override_ != "auto";
+    const std::string detected = active_wifi_interface();
+    const std::string monitored_iface = override_set ? wifi_interface_override_ : detected;
+
+    auto iface_msg = std_msgs::msg::String();
+    iface_msg.data = detected;  // Always publish the *actual* interface
+    wifi_interface_pub_->publish(iface_msg);
+
+    float wifi_val = wifi_signal_strength(monitored_iface);
     auto wifi_msg = std_msgs::msg::Float32();
     wifi_msg.data = wifi_val;
     wifi_signal_pub_->publish(wifi_msg);
+
+    // Expected-interface health check. Skipped when no expectation is set.
+    // Healthy iff the actual active wifi NIC matches the configured one;
+    // mismatch is a deliberate red flag (failover to the fallback antenna).
+    if (!expected_wifi_interface_.empty()) {
+      wifi_interface_healthy_ = (detected == expected_wifi_interface_);
+      auto wifi_iface_health_msg = std_msgs::msg::Bool();
+      wifi_iface_health_msg.data = wifi_interface_healthy_;
+      wifi_interface_health_pub_->publish(wifi_iface_health_msg);
+      if (!wifi_interface_healthy_) {
+        RCLCPP_WARN_THROTTLE(
+          this->get_logger(), *this->get_clock(), 5000,
+          "WiFi interface mismatch: expected '%s', detected '%s'", expected_wifi_interface_.c_str(),
+          detected.empty() ? "<none>" : detected.c_str());
+      }
+    } else {
+      wifi_interface_healthy_ = true;
+    }
 
     float controller_battery_val = -1.0f;
     if (!controller_mac_.empty()) {
@@ -448,11 +587,13 @@ private:
     }
 
     // Calculate and publish overall health
-    bool overall_status = true;
-    for (auto const & [name, check] : health_checks_) {
-      if (!check.is_healthy) {
-        overall_status = false;
-        break;  // One failure makes the whole system unhealthy
+    bool overall_status = wifi_interface_healthy_;
+    if (overall_status) {
+      for (auto const & [name, check] : health_checks_) {
+        if (!check.is_healthy) {
+          overall_status = false;
+          break;  // One failure makes the whole system unhealthy
+        }
       }
     }
     auto health_msg = std_msgs::msg::Bool();
@@ -463,15 +604,17 @@ private:
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr cpu_usage_pub_, memory_pub_, disk_pub_,
     cpu_temp_pub_, cpu_voltage_pub_, wifi_signal_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr platform_pub_, ip_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr platform_pub_, ip_pub_, wifi_interface_pub_;
   std::vector<rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr> core_pubs_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr controller_battery_pub_;
 
   // Health check members
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr overall_health_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr wifi_interface_health_pub_;
   std::map<std::string, HealthCheck> health_checks_;
+  bool wifi_interface_healthy_ = true;
 
-  std::string controller_mac_, wifi_interface_, ip_interface_;
+  std::string controller_mac_, wifi_interface_override_, expected_wifi_interface_, ip_interface_;
   double update_frequency_;
   int num_cores_;
   std::vector<long> prev_cpu_times_;

@@ -16,14 +16,15 @@
 /// @brief Unit tests for /proc-based system metric readers.
 ///
 /// These tests verify:
-///   - memory_usage_percentage()  reads /proc/meminfo (no shell fork)
-///   - disk_usage_percentage()    reads via statvfs("/")  (no shell fork)
-///   - ip_address()               uses getifaddrs()       (no shell fork)
-///   - wifi_signal_strength()     reads /proc/net/wireless (no shell fork)
+///   - memory_usage_percentage()    reads /proc/meminfo (no shell fork)
+///   - disk_usage_percentage()      reads via statvfs("/")  (no shell fork)
+///   - ip_address()                 uses getifaddrs()       (no shell fork)
+///   - wifi_signal_strength()       reads /proc/net/wireless (no shell fork)
+///   - associated_wifi_interfaces() parses /proc/net/wireless
+///   - default_route_interface()    parses /proc/net/route
 ///
-/// All functions are tested for:
-///   - returning values in a sane range [0, 100]
-///   - not crashing on a live Linux system
+/// The wifi-interface parsers are tested through stream-based variants so the
+/// test does not depend on a specific live network state.
 ///
 /// No ROS 2 node is spun up here — these are pure C++ unit tests.
 
@@ -36,6 +37,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 // ── Re-implement the slim versions under test (same logic as system_monitor_node.cpp)
 // We duplicate the implementations here to keep the test self-contained without
@@ -133,6 +136,50 @@ static float test_wifi_signal_strength(const std::string & interface)
   return 0.0f;
 }
 
+// Stream variants of the new wifi-interface helpers so the tests can feed
+// canned /proc snapshots and stay deterministic across hosts.
+static std::vector<std::pair<std::string, float>> test_associated_wifi_interfaces(std::istream & in)
+{
+  std::vector<std::pair<std::string, float>> result;
+  std::string line;
+  std::getline(in, line);
+  std::getline(in, line);
+  while (std::getline(in, line)) {
+    std::istringstream ss(line);
+    std::string iface_col;
+    ss >> iface_col;
+    if (iface_col.empty() || iface_col.back() != ':') {
+      continue;
+    }
+    iface_col.pop_back();
+    int status = 0;
+    float link = 0.0f;
+    ss >> std::hex >> status >> std::dec >> link;
+    if (link > 0.0f) {
+      result.emplace_back(std::move(iface_col), link);
+    }
+  }
+  return result;
+}
+
+static std::string test_default_route_interface(std::istream & in)
+{
+  std::string line;
+  std::getline(in, line);
+  while (std::getline(in, line)) {
+    std::istringstream ss(line);
+    std::string iface, dest_hex, gw_hex, mask_hex;
+    int flags = 0, refcnt = 0, use = 0, metric = 0;
+    if (!(ss >> iface >> dest_hex >> gw_hex >> flags >> refcnt >> use >> metric >> mask_hex)) {
+      continue;
+    }
+    if (dest_hex == "00000000" && mask_hex == "00000000") {
+      return iface;
+    }
+  }
+  return "";
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 TEST(SystemMetrics, MemoryUsageInRange)
@@ -211,6 +258,48 @@ TEST(SystemMetrics, NoShellForkInDiskRead)
   {
   };
   EXPECT_EQ(statvfs("/", &fs), 0) << "statvfs('/') must work without `df`";
+}
+
+TEST(WifiInterface, AssociatedSkipsZeroLink)
+{
+  // Two NICs, only wlp1s0 has a non-zero link quality; wlan0 is up but
+  // unassociated (link=0).
+  std::istringstream in(
+    "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n"
+    " face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n"
+    "wlp1s0: 0000   70.  -40.  -256        0      0      0      0     24        0\n"
+    "wlan0: 0000    0.  -110.  -256        0      0      0      0      0        0\n");
+  const auto associated = test_associated_wifi_interfaces(in);
+  ASSERT_EQ(associated.size(), 1u);
+  EXPECT_EQ(associated[0].first, "wlp1s0");
+  EXPECT_FLOAT_EQ(associated[0].second, 70.0f);
+}
+
+TEST(WifiInterface, AssociatedHandlesEmptyHeaderOnly)
+{
+  std::istringstream in(
+    "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n"
+    " face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n");
+  EXPECT_TRUE(test_associated_wifi_interfaces(in).empty());
+}
+
+TEST(WifiInterface, DefaultRoutePicksZeroDestZeroMask)
+{
+  // First non-default route entry is on eth0 (a /24); the default route is
+  // on wlp1s0. Parser must skip non-defaults and pick wlp1s0.
+  std::istringstream in(
+    "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    "eth0\t0000A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n"
+    "wlp1s0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n");
+  EXPECT_EQ(test_default_route_interface(in), "wlp1s0");
+}
+
+TEST(WifiInterface, DefaultRouteEmptyWhenNoneDeclared)
+{
+  std::istringstream in(
+    "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n"
+    "eth0\t0000A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0\n");
+  EXPECT_EQ(test_default_route_interface(in), "");
 }
 
 int main(int argc, char ** argv)
